@@ -119,28 +119,32 @@ run_libero_plus_batch() {
     echo "[plus-batch] Total tasks: $total_tasks"
 
     # ---- Static chunking: split task_list into NUM_WORKERS chunks ----
-    # Each worker gets a contiguous slice. Remainder distributed to the first
-    # few workers so every task is assigned exactly once.
-    local base=$((total_tasks / NUM_WORKERS))
-    local rem=$((total_tasks % NUM_WORKERS))
+    # Round-robin (interleaved) assignment: task at line N goes to worker
+    # (N-1) % NUM_WORKERS. This spreads hard/easy tasks across all workers so
+    # no worker gets stuck on a contiguous block of hard tasks (e.g. a long
+    # run of low-success goal/10 tasks that run to max_steps). Contiguous
+    # slicing used to let one worker idle on a 600s/task block while others
+    # flew through 20s spatial tasks -- round-robin removes that imbalance.
+    #
+    # Resume-skip is unaffected: it keys on per-task result files, not on
+    # chunk assignment, so already-done tasks are skipped regardless of how
+    # the chunks were sliced.
     local chunk_files=()
-    local start=1
     local wid=0
     while [ $wid -lt $NUM_WORKERS ]; do
-        local size=$base
-        if [ $wid -lt $rem ]; then
-            size=$((size + 1))
-        fi
-        local chunk_file="$CHUNK_DIR/chunk_worker${wid}.txt"
-        if [ $size -gt 0 ]; then
-            sed -n "${start},$((start + size - 1))p" "$task_list_file" > "$chunk_file"
-        else
-            : > "$chunk_file"
-        fi
-        chunk_files+=("$chunk_file")
-        echo "[plus-batch] worker $wid -> $size tasks ($chunk_file)"
-        start=$((start + size))
+        chunk_files+=("$CHUNK_DIR/chunk_worker${wid}.txt")
+        : > "$CHUNK_DIR/chunk_worker${wid}.txt"   # truncate in case of re-run
         wid=$((wid + 1))
+    done
+    local linenum=0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        linenum=$((linenum + 1))
+        wid=$(( (linenum - 1) % NUM_WORKERS ))
+        echo "$line" >> "${chunk_files[$wid]}"
+    done < "$task_list_file"
+    for wid in "${!chunk_files[@]}"; do
+        echo "[plus-batch] worker $wid -> $(wc -l < "${chunk_files[$wid]}") tasks (${chunk_files[$wid]})"
     done
 
     # ---- tmux session ----
