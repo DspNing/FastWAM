@@ -1,4 +1,7 @@
 _target_: fastwam.runtime.create_fastwam
+# Bound backbone switch: "wan22" (5B, production, default) | "wan21" (1.3B, fast experiments).
+# Switching changes model_id, VAE (Wan2.2_VAE z48 16x vs Wan2.1_VAE z16 8x), and video_dit_config together.
+backbone: wan21
 model_id: Wan-AI/Wan2.2-TI2V-5B
 tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
 tokenizer_max_len: 128
@@ -6,43 +9,88 @@ load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
-action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+# action_dit_pretrained_path: nested by backbone. Each points to the ActionDiT backbone
+# interpolated from the corresponding video DiT (run scripts/preprocess_action_dit_backbone.py).
+action_dit_pretrained_path:
+  wan22: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+  wan21: checkpoints/ActionDiT_linear_interp_Wan21_1_3B_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
+# video_dit_config is a nested preset selected by `backbone`. create_fastwam picks the
+# matching sub-dict (wan22 or wan21) before constructing WanVideoDiT.
 video_dit_config:
-  has_image_input: false
-  patch_size: [1, 2, 2]
-  in_dim: 48
-  hidden_dim: 3072
-  ffn_dim: 14336
-  freq_dim: 256
-  text_dim: 4096
-  out_dim: 48
-  num_heads: 24
-  attn_head_dim: 128
-  num_layers: 30
-  eps: 1.0e-06
-  seperated_timestep: true
-  require_clip_embedding: false
-  require_vae_embedding: false
-  fuse_vae_embedding_in_latents: true
-  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
-  video_attention_mask_mode: "first_frame_causal" # default
-  action_conditioned: false
-  action_dim: ${data.train.processor.action_output_dim}
-  action_group_causal_mask_mode: "group_diagonal"
+  wan22:
+    has_image_input: false
+    patch_size: [1, 2, 2]
+    in_dim: 48
+    hidden_dim: 3072
+    ffn_dim: 14336
+    freq_dim: 256
+    text_dim: 4096
+    out_dim: 48
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    eps: 1.0e-06
+    seperated_timestep: true
+    require_clip_embedding: false
+    require_vae_embedding: false
+    fuse_vae_embedding_in_latents: true
+    use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+    video_attention_mask_mode: "first_frame_causal" # default
+    action_conditioned: false
+    action_dim: ${data.train.processor.action_output_dim}
+    action_group_causal_mask_mode: "group_diagonal"
+  wan21:
+    # Wan2.1-T2V-1.3B: dim 1536, 12 heads x 128, 30 layers, ffn 8960. VAE z_dim=16 (in_dim/out_dim=16).
+    has_image_input: false
+    patch_size: [1, 2, 2]
+    in_dim: 16
+    hidden_dim: 1536
+    ffn_dim: 8960
+    freq_dim: 256
+    text_dim: 4096
+    out_dim: 16
+    num_heads: 12
+    attn_head_dim: 128
+    num_layers: 30
+    eps: 1.0e-06
+    seperated_timestep: true
+    require_clip_embedding: false
+    require_vae_embedding: false
+    fuse_vae_embedding_in_latents: true
+    use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+    video_attention_mask_mode: "first_frame_causal"
+    action_conditioned: false
+    action_dim: ${data.train.processor.action_output_dim}
+    action_group_causal_mask_mode: "group_diagonal"
 
+# action_dit_config also nested: MoT requires num_layers/num_heads/attn_head_dim to match
+# the video expert, so num_heads follows the backbone (24 for wan22, 12 for wan21).
+# action hidden_dim stays 1024 (interpolated down from the video DiT) for both backbones.
 action_dit_config:
-  action_dim: ${data.train.processor.action_output_dim}
-  hidden_dim: 1024
-  ffn_dim: 4096
-  num_heads: 24
-  attn_head_dim: 128
-  num_layers: 30
-  text_dim: 4096
-  freq_dim: 256
-  eps: 1.0e-06
-  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  wan22:
+    action_dim: ${data.train.processor.action_output_dim}
+    hidden_dim: 1024
+    ffn_dim: 4096
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    text_dim: 4096
+    freq_dim: 256
+    eps: 1.0e-06
+    use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  wan21:
+    action_dim: ${data.train.processor.action_output_dim}
+    hidden_dim: 1024
+    ffn_dim: 4096
+    num_heads: 12
+    attn_head_dim: 128
+    num_layers: 30
+    text_dim: 4096
+    freq_dim: 256
+    eps: 1.0e-06
+    use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
 
 video_scheduler:
   train_shift: 5.0

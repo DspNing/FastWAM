@@ -2,6 +2,7 @@ import logging
 import os
 import inspect
 from pathlib import Path
+from typing import Any
 
 import torch
 from hydra.utils import instantiate
@@ -81,7 +82,7 @@ def create_fastwam(
     load_text_encoder: bool = True,
     proprio_dim: int | None = None,
     action_dit_config=None,
-    action_dit_pretrained_path: str | None = None,
+    action_dit_pretrained_path: Any = None,
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
     action_scheduler=None,
@@ -90,11 +91,20 @@ def create_fastwam(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    backbone: str = "wan22",
 ):
     from .models.wan22.fastwam import FastWAM
 
+    # Bound backbone switch: pick the matching video_dit_config preset when provided.
+    # `video_dit_config` may be a dict (single preset, legacy) or a mapping with
+    # `wan22`/`wan21` sub-dicts. The `backbone` field selects which to use.
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
+    if isinstance(video_dit_config, dict) and backbone in video_dit_config and isinstance(video_dit_config[backbone], dict):
+        # Heuristic: a nested preset has backbone keys like {"wan22": {...}, "wan21": {...}}.
+        # Distinguish from a flat config by checking for these preset keys at top level.
+        if set(video_dit_config.keys()) <= {"wan22", "wan21"}:
+            video_dit_config = video_dit_config[backbone]
     if not isinstance(video_dit_config, dict):
         raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
 
@@ -102,8 +112,17 @@ def create_fastwam(
         action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
     if action_dit_config is None:
         action_dit_config = {}
+    # Same nested-preset selection as video_dit_config (MoT requires matching num_heads etc).
+    if isinstance(action_dit_config, dict) and set(action_dit_config.keys()) <= {"wan22", "wan21"} and backbone in action_dit_config and isinstance(action_dit_config[backbone], dict):
+        action_dit_config = action_dit_config[backbone]
     if not isinstance(action_dit_config, dict):
         raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+
+    # action_dit_pretrained_path may also be nested {wan22: ..., wan21: ...} by backbone.
+    if isinstance(action_dit_pretrained_path, DictConfig):
+        action_dit_pretrained_path = OmegaConf.to_container(action_dit_pretrained_path, resolve=True)
+    if isinstance(action_dit_pretrained_path, dict) and backbone in action_dit_pretrained_path:
+        action_dit_pretrained_path = action_dit_pretrained_path[backbone]
 
     if isinstance(video_scheduler, DictConfig):
         video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
@@ -155,6 +174,7 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        backbone=str(backbone),
     )
 
 
@@ -166,7 +186,7 @@ def create_fastwam_joint(
     load_text_encoder: bool = True,
     proprio_dim: int | None = None,
     action_dit_config=None,
-    action_dit_pretrained_path: str | None = None,
+    action_dit_pretrained_path: Any = None,
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
     action_scheduler=None,
@@ -251,7 +271,7 @@ def create_fastwam_idm(
     load_text_encoder: bool = True,
     proprio_dim: int | None = None,
     action_dit_config=None,
-    action_dit_pretrained_path: str | None = None,
+    action_dit_pretrained_path: Any = None,
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
     action_scheduler=None,
