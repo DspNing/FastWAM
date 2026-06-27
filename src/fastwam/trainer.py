@@ -396,15 +396,18 @@ class Wan22Trainer:
         prev_skip = getattr(base_ds, "skip_images", False) if base_ds is not None else False
         prev_cache = getattr(self.val_dataset, "vae_latent_cache_dir", None)
         prev_mem_cache = getattr(self.val_dataset, "_latent_cache", None)
+        prev_ap_cache = getattr(self.val_dataset, "_ap_cache", None)
         if base_ds is not None:
             base_ds.skip_images = False
         self.val_dataset.vae_latent_cache_dir = None  # force decode path for this one sample
         self.val_dataset._latent_cache = None  # also disable in-memory latent cache
+        self.val_dataset._ap_cache = None  # also disable action/proprio cache (eval needs raw video)
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
         if base_ds is not None:
             base_ds.skip_images = prev_skip
         self.val_dataset.vae_latent_cache_dir = prev_cache
         self.val_dataset._latent_cache = prev_mem_cache
+        self.val_dataset._ap_cache = prev_ap_cache
 
         # 1. training loss
         with self.accelerator.autocast():

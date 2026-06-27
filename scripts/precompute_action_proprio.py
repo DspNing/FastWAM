@@ -52,11 +52,12 @@ def build_dataset_and_processor(task: str, backbone: str = "wan21"):
 
 
 def extract_suite_data(ds):
-    """Batch-extract raw action/state + episode boundaries from each suite.
+    """Batch-extract raw action/state + episode boundaries + task from each suite.
 
     Returns a list (per suite) of dicts with:
       action_tensor: [N_suite, action_dim]  (raw, unnormalized)
       state_tensor:  [N_suite, state_dim]   (raw, unnormalized)
+      tasks: list[str]  (task/instruction string per frame)
       ep_from: list[int]  (episode start frame indices, global within suite)
       ep_to:   list[int]  (episode end frame indices)
       suite_start: int    (this suite's start idx in the global MultiLeRobotDataset)
@@ -77,9 +78,14 @@ def extract_suite_data(ds):
         ep_from = d.episode_data_index["from"].tolist()  # episode start frames
         ep_to = d.episode_data_index["to"].tolist()      # episode end frames
 
+        # Extract task/instruction per frame: task_index -> task string via meta.tasks
+        task_indices = hf["task_index"]  # list of tensors
+        tasks = [d.meta.tasks[int(ti)] for ti in task_indices]  # list[str]
+
         suites.append({
             "action_tensor": action_tensor,
             "state_tensor": state_tensor,
+            "tasks": tasks,
             "ep_from": ep_from,
             "ep_to": ep_to,
             "suite_start": suite_start,
@@ -240,14 +246,19 @@ def main():
     print(f"  normalized action: {tuple(norm_action.shape)}, proprio: {tuple(norm_proprio.shape)}, "
           f"in {time.time()-t0:.1f}s")
 
-    # Build idx->data dict and save
+    # Build idx->data dict and save (include task/instruction for each idx)
     print(f"\nSaving to {args.output}...")
+    # Collect tasks per global idx
+    all_tasks = []
+    for su in suites:
+        all_tasks.extend(su["tasks"])
     cache = {}
     for idx in range(total):
         cache[idx] = {
             "action": norm_action[idx],
             "proprio": norm_proprio[idx],
             "action_is_pad": norm_action_is_pad[idx],
+            "task": all_tasks[idx],  # instruction string (for context lookup)
         }
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     torch.save(cache, args.output)

@@ -43,6 +43,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         vae_latent_cache_dir: Optional[str] = None, # dir of latent_*.pt to skip decode+VAE in training
+        action_proprio_cache_path: Optional[str] = None, # path to .pt of normalized action/proprio to skip parquet+processor
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -79,6 +80,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
         self.vae_latent_cache_dir = vae_latent_cache_dir
+        self.action_proprio_cache_path = action_proprio_cache_path
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -143,10 +145,77 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             logger.info(f"Pre-loaded {len(self._latent_cache)} latents in {_time.time()-_t0:.1f}s "
                         f"(~{sum(v[0].nelement()*v[0].element_size() for v in self._latent_cache.values())/1e9:.1f}GB)")
 
+        # Pre-load cached action/proprio (normalized) into memory. When present, _get skips
+        # lerobot_dataset[idx] + processor entirely (the 519ms parquet-select bottleneck),
+        # reading action/proprio/task from this in-memory dict instead.
+        self._ap_cache = None  # dict[idx] -> {action, proprio, action_is_pad, task}
+        if self.action_proprio_cache_path is not None and os.path.exists(self.action_proprio_cache_path):
+            import time as _time
+            _t0 = _time.time()
+            logger.info(f"Pre-loading action/proprio cache from {self.action_proprio_cache_path}...")
+            self._ap_cache = torch.load(self.action_proprio_cache_path, map_location="cpu", weights_only=False)
+            logger.info(f"Pre-loaded {len(self._ap_cache)} action/proprio entries in {_time.time()-_t0:.1f}s")
+
     def __len__(self):
         return len(self.lerobot_dataset)
 
+    def _get_from_cache(self, idx):
+        """Fast path: build sample entirely from in-memory caches (latent + action/proprio).
+
+        Skips lerobot_dataset[idx] (parquet select, 519ms) and processor.preprocess (normalize).
+        Returns the same dict structure as _get, with video_latent + action + proprio + context.
+        """
+        ap = self._ap_cache[idx]
+        action = ap["action"]            # [32, 7] normalized
+        proprio = ap["proprio"]          # [32, 8] normalized
+        action_is_pad = ap["action_is_pad"]  # [32]
+        task = ap["task"]                # instruction string
+
+        # video_latent from _latent_cache (already in memory)
+        video_latent = None
+        image_is_pad = None
+        if self._latent_cache is not None:
+            entry = self._latent_cache.get(idx, None)
+            if entry is not None:
+                video_latent, image_is_pad = entry
+        if video_latent is None:
+            raise ValueError(f"idx={idx}: action/proprio cache hit but no latent in _latent_cache. "
+                             "Both caches must be used together.")
+
+        # context from text embeds cache (using the cached task string)
+        if self.override_instruction is not None:
+            task = self.override_instruction
+        instruction = DEFAULT_PROMPT.format(task=task)
+        context, context_mask = self._get_cached_text_context(instruction)
+        # NOTE: to keep consistent with wan2.2's behavior
+        context[~context_mask] = 0.0
+        context_mask = torch.ones_like(context_mask)
+
+        # image_is_pad from latent cache (aligned with video_sample_indices)
+        # action_is_pad/proprio_is_pad not needed by build_inputs; include for completeness
+        data = {
+            "action": action,
+            "proprio": proprio,
+            "prompt": instruction,
+            "context": context,
+            "context_mask": context_mask,
+            "image_is_pad": image_is_pad,
+            "action_is_pad": action_is_pad,
+            "proprio_is_pad": torch.zeros_like(action_is_pad),  # not used in training
+        }
+        if video_latent is not None:
+            data["video_latent"] = video_latent
+        else:
+            data["video"] = None
+        return data
+
     def _get(self, idx):
+        # Fast path: when action/proprio cache is loaded, skip lerobot_dataset + processor entirely.
+        # This avoids the 519ms parquet-select bottleneck. We still need video_latent (from
+        # _latent_cache) and context (from text embeds cache, using the cached task string).
+        if self._ap_cache is not None and idx in self._ap_cache:
+            return self._get_from_cache(idx)
+
         sample_idx = idx
         sample = None
         for attempt in range(self.max_padding_retry + 1):
