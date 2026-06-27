@@ -39,7 +39,7 @@ def _init_distributed():
         torch.cuda.set_device(local_rank)
 
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend, init_method="env://")
+        dist.init_process_group(backend=backend, init_method="env://", device_id=torch.device(f"cuda:{local_rank}"))
 
     return True, dist.get_rank(), dist.get_world_size(), local_rank
 

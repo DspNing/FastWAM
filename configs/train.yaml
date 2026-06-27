@@ -40,6 +40,11 @@ wandb:
   group: null
   mode: online
 
+# tensorboard
+tensorboard:
+  enabled: true
+  log_dir: ${output_dir}/tensorboard
+
 hydra:
   job:
     chdir: false

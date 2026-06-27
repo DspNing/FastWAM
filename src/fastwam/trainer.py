@@ -55,6 +55,7 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        self.tensorboard_enabled = bool(cfg.tensorboard.enabled)
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -122,7 +123,9 @@ class Wan22Trainer:
         )
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
+        self.tensorboard_writer = None
         self._init_wandb()
+        self._init_tensorboard()
         self._resume_or_load_checkpoint()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
@@ -158,11 +161,41 @@ class Wan22Trainer:
             return
         self.wandb_run.log(payload, step=self.global_step)
 
+    def _init_tensorboard(self):
+        if not self.tensorboard_enabled or not self.accelerator.is_main_process:
+            return
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as e:
+            raise ImportError(
+                "tensorboard logging is enabled in config (`tensorboard.enabled=true`) "
+                "but tensorboard is not installed."
+            ) from e
+
+        log_dir = str(self.cfg.tensorboard.log_dir)
+        ensure_dir(log_dir)
+        self.tensorboard_writer = SummaryWriter(log_dir=log_dir)
+        logger.info("Initialized tensorboard writer: log_dir=%s", log_dir)
+
+    def _tensorboard_log(self, payload: dict):
+        if self.tensorboard_writer is None:
+            return
+        for key, value in payload.items():
+            if isinstance(value, (int, float)):
+                self.tensorboard_writer.add_scalar(key, value, self.global_step)
+
     def _finish_wandb(self):
         if self.wandb_run is None:
             return
         self.wandb_run.finish()
         self.wandb_run = None
+
+    def _finish_tensorboard(self):
+        if self.tensorboard_writer is None:
+            return
+        self.tensorboard_writer.flush()
+        self.tensorboard_writer.close()
+        self.tensorboard_writer = None
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -179,9 +212,7 @@ class Wan22Trainer:
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
-            # Keep workers alive across epochs (avoids per-epoch respawn cost) and prefetch
-            # ahead so the GPU rarely starves while workers decode the next batch.
-            persistent_workers=self.num_workers > 0,
+            persistent_workers=True if self.num_workers > 0 else False,
             prefetch_factor=4 if self.num_workers > 0 else None,
         )
 
@@ -746,6 +777,7 @@ class Wan22Trainer:
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
+                        self._tensorboard_log(wandb_payload)
 
                     if (
                         self.eval_every > 0
@@ -780,6 +812,7 @@ class Wan22Trainer:
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
                             self._wandb_log(eval_payload)
+                            self._tensorboard_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()
@@ -800,6 +833,8 @@ class Wan22Trainer:
                                 ckpt_info["weights_path"],
                                 ckpt_info["state_path"],
                             )
+                            self._finish_wandb()
+                            self._finish_tensorboard()
                         return
 
         ckpt_info = self.save_checkpoint()
@@ -810,4 +845,6 @@ class Wan22Trainer:
                 ckpt_info["weights_path"],
                 ckpt_info["state_path"],
             )
+            self._finish_wandb()
+            self._finish_tensorboard()
         
