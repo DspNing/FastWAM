@@ -389,7 +389,22 @@ class Wan22Trainer:
         # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
         eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
+        # Val reuses train_ds (which has skip_images=True for cached-latent training). Eval needs
+        # raw video pixels for PSNR/SSIM, so temporarily disable skip_images AND the latent cache
+        # to decode the eval sample, then restore both so training keeps the fast cached path.
+        base_ds = self.val_dataset.lerobot_dataset if hasattr(self.val_dataset, "lerobot_dataset") else None
+        prev_skip = getattr(base_ds, "skip_images", False) if base_ds is not None else False
+        prev_cache = getattr(self.val_dataset, "vae_latent_cache_dir", None)
+        prev_mem_cache = getattr(self.val_dataset, "_latent_cache", None)
+        if base_ds is not None:
+            base_ds.skip_images = False
+        self.val_dataset.vae_latent_cache_dir = None  # force decode path for this one sample
+        self.val_dataset._latent_cache = None  # also disable in-memory latent cache
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
+        if base_ds is not None:
+            base_ds.skip_images = prev_skip
+        self.val_dataset.vae_latent_cache_dir = prev_cache
+        self.val_dataset._latent_cache = prev_mem_cache
 
         # 1. training loss
         with self.accelerator.autocast():

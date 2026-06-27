@@ -277,7 +277,10 @@ class FastWAM(torch.nn.Module):
         return frames
 
     def build_inputs(self, sample, tiled: bool = False):
-        video = sample["video"]
+        video_latent = sample.get("video_latent", None)
+        video = sample.get("video", None)
+        if video_latent is None and video is None:
+            raise ValueError("FastWAM training requires either `sample['video']` or `sample['video_latent']`.")
         if "context" not in sample or "context_mask" not in sample:
             raise ValueError(
                 "FastWAM training requires `sample['context']` and `sample['context_mask']`."
@@ -285,20 +288,35 @@ class FastWAM(torch.nn.Module):
         context = sample["context"]
         context_mask = sample["context_mask"]
         proprio = sample.get("proprio", None)
-        if video.ndim != 5:
-            raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
-        if video.shape[1] != 3:
-            raise ValueError(f"`sample['video']` channel dimension must be 3, got shape {tuple(video.shape)}")
+        # Video shape checks only apply to the pixel path (video is [B,3,T,H,W]).
+        # When using cached latents, video is None and these checks are skipped.
+        if video is not None:
+            if video.ndim != 5:
+                raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
+            if video.shape[1] != 3:
+                raise ValueError(f"`sample['video']` channel dimension must be 3, got shape {tuple(video.shape)}")
 
-        batch_size, _, num_frames, height, width = video.shape
-        if height % 16 != 0 or width % 16 != 0:
-            raise ValueError(
-                f"Video spatial dims must be multiples of 16, got H={height}, W={width}"
-            )
-        if num_frames % 4 != 1:
-            raise ValueError(f"Video T must satisfy T % 4 == 1, got T={num_frames}")
-        if num_frames <= 1:
-            raise ValueError(f"Video T must be > 1 for action-conditioned training, got T={num_frames}")
+            batch_size, _, num_frames, height, width = video.shape
+            if height % 16 != 0 or width % 16 != 0:
+                raise ValueError(
+                    f"Video spatial dims must be multiples of 16, got H={height}, W={width}"
+                )
+            if num_frames % 4 != 1:
+                raise ValueError(f"Video T must satisfy T % 4 == 1, got T={num_frames}")
+            if num_frames <= 1:
+                raise ValueError(f"Video T must be > 1 for action-conditioned training, got T={num_frames}")
+        else:
+            # Cached latent path: infer batch_size from the latent ([B, z_dim, T_lat, H_lat, W_lat]).
+            batch_size = video_latent.shape[0]
+            # num_frames (video frames) is needed for action_horizon / image_is_pad checks below.
+            # Infer from image_is_pad length (== num video frames), or from latent T_lat via VAE
+            # temporal downsample factor: num_frames = (T_lat - 1) * 4 + 1.
+            image_is_pad_tmp = sample.get("image_is_pad", None)
+            if image_is_pad_tmp is not None:
+                num_frames = int(image_is_pad_tmp.shape[-1])
+            else:
+                t_lat = video_latent.shape[2]
+                num_frames = (t_lat - 1) * int(self.vae.temporal_downsample_factor) + 1
 
         if "action" not in sample:
             raise ValueError("`sample['action']` is required for FastWAM training.")
@@ -336,8 +354,12 @@ class FastWAM(torch.nn.Module):
                     f"got {tuple(image_is_pad.shape)} vs expected ({batch_size}, {num_frames})"
                 )
         
-        input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        input_latents = self._encode_video_latents(input_video, tiled=tiled)
+        if video_latent is not None:
+            # Cached latent path: skip VAE encode entirely (CPU/VAE bottleneck removed).
+            input_latents = video_latent.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        else:
+            input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            input_latents = self._encode_video_latents(input_video, tiled=tiled)
 
         first_frame_latents = None
         fuse_flag = False

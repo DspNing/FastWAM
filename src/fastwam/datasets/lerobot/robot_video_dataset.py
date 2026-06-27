@@ -42,6 +42,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        vae_latent_cache_dir: Optional[str] = None, # dir of latent_*.pt to skip decode+VAE in training
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -64,6 +65,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
+        # When VAE latents are cached, skip mp4 decode in the base dataset (CPU bottleneck).
+        # action/proprio are still read from parquet. Only safe when every sample has a cached latent
+        # (i.e. training with vae_latent_cache_dir set). Eval/preprocess do not set the cache dir.
+        if vae_latent_cache_dir is not None:
+            self.lerobot_dataset.skip_images = True
 
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
@@ -72,6 +78,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.vae_latent_cache_dir = vae_latent_cache_dir
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -108,7 +115,34 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
-        
+
+        # Pre-load all cached VAE latents into memory once (in __init__, main process).
+        # DataLoader workers fork after this, so Linux copy-on-write lets all workers share
+        # this read-only dict without duplicating the ~10.5GB. This removes per-sample
+        # torch.load() + file IO from the hot path.
+        self._latent_cache = None  # dict[idx] -> (latent tensor, image_is_pad)
+        if self.vae_latent_cache_dir is not None:
+            import time as _time
+            _t0 = _time.time()
+            cache_dir = self.vae_latent_cache_dir
+            # Count available latents to size the dict.
+            import glob as _glob
+            files = _glob.glob(os.path.join(cache_dir, "latent_*.pt"))
+            logger.info(f"Pre-loading {len(files)} cached VAE latents into memory from {cache_dir}...")
+            self._latent_cache = {}
+            for fp in files:
+                # parse idx from filename latent_{idx:07d}.pt
+                try:
+                    idx = int(os.path.basename(fp)[7:-3])
+                except ValueError:
+                    continue
+                payload = torch.load(fp, map_location="cpu", weights_only=False)
+                latent = payload["latent"].squeeze(0)  # [z_dim, T_lat, H, W]
+                image_is_pad_c = payload.get("image_is_pad", None)
+                self._latent_cache[idx] = (latent, image_is_pad_c)
+            logger.info(f"Pre-loaded {len(self._latent_cache)} latents in {_time.time()-_t0:.1f}s "
+                        f"(~{sum(v[0].nelement()*v[0].element_size() for v in self._latent_cache.values())/1e9:.1f}GB)")
+
     def __len__(self):
         return len(self.lerobot_dataset)
 
@@ -136,77 +170,108 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 break
 
             sample_idx = np.random.randint(len(self.lerobot_dataset))
-        
+
         image_is_pad = sample["image_is_pad"]
 
-        video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
-        num_cameras = 1
-        if video.ndim == 5:
-            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
-            num_cameras, T_video, C, H, W = video.shape
-        else:
-            assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
-            T_video, C, H, W = video.shape
-        image_is_pad = image_is_pad[self.video_sample_indices]
+        # Fast path: if pre-cached VAE latents exist for this sample, load the latent directly
+        # and skip mp4 decode + resize + normalize (the CPU bottleneck). The latent was encoded
+        # with the same dataset config, so it is byte-identical to what _encode_video_latents
+        # would produce from the video below.
+        video_latent = None
+        if self._latent_cache is not None:
+            # In-memory cache (pre-loaded in __init__, shared via COW across workers).
+            entry = self._latent_cache.get(sample_idx, None)
+            if entry is not None:
+                video_latent, image_is_pad_cached = entry
+                if image_is_pad_cached is not None:
+                    image_is_pad = image_is_pad_cached
+        elif self.vae_latent_cache_dir is not None:
+            latent_path = os.path.join(self.vae_latent_cache_dir, f"latent_{sample_idx:07d}.pt")
+            if os.path.exists(latent_path):
+                payload = torch.load(latent_path, map_location="cpu", weights_only=False)
+                # Cached latent is [1, z_dim, T_lat, H_lat, W_lat]; drop the leading 1 so that
+                # after DataLoader collate the batch is [B, z_dim, T_lat, H, W] (not [B,1,...]).
+                video_latent = payload["latent"].squeeze(0)  # [z_dim, T_lat, H_lat, W_lat]
+                if "image_is_pad" in payload:
+                    # The cached image_is_pad is aligned with video_sample_indices already.
+                    image_is_pad = payload["image_is_pad"]
 
-        video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
+        if video_latent is None:
+            video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
+            num_cameras = 1
+            if video.ndim == 5:
+                video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+                num_cameras, T_video, C, H, W = video.shape
+            else:
+                assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
+                video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+                T_video, C, H, W = video.shape
+            image_is_pad = image_is_pad[self.video_sample_indices]
+
+            video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
         if self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
                 raise ValueError(
                     f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
                 )
-            cam_top = transforms_F.resize(
-                video[0],
-                size=[256, 320],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 256, 320]
-            cam_left = transforms_F.resize(
-                video[1],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            cam_right = transforms_F.resize(
-                video[2],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
-            video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
-        elif num_cameras > 1:
-            if self.concat_multi_camera == "horizontal":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
-            elif self.concat_multi_camera == "vertical":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)  # [T_video, C, num_cameras*H, W]
+        if video_latent is None:
+            if self.concat_multi_camera == "robotwin":
+                if num_cameras != 3:
+                    raise ValueError(
+                        f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
+                    )
+                cam_top = transforms_F.resize(
+                    video[0],
+                    size=[256, 320],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )  # [T_video, C, 256, 320]
+                cam_left = transforms_F.resize(
+                    video[1],
+                    size=[128, 160],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )  # [T_video, C, 128, 160]
+                cam_right = transforms_F.resize(
+                    video[2],
+                    size=[128, 160],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )  # [T_video, C, 128, 160]
+                bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
+                video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
+            elif num_cameras > 1:
+                if self.concat_multi_camera == "horizontal":
+                    video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
+                elif self.concat_multi_camera == "vertical":
+                    video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)  # [T_video, C, num_cameras*H, W]
+                else:
+                    raise ValueError(
+                        f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
+                        "Expected one of: horizontal, vertical, robotwin."
+                    )
             else:
-                raise ValueError(
-                    f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
-                    "Expected one of: horizontal, vertical, robotwin."
-                )
-        else:
-            video = video.squeeze(0)  # [T_video, C, H, W]
+                video = video.squeeze(0)  # [T_video, C, H, W]
 
-        # final resize and normalization
-        video = self.resize_transform(video)
-        video = self.crop_transform(video)
-        video = self.normalize_transform(video)  # [T_video, C, H, W]
+            # final resize and normalization
+            video = self.resize_transform(video)
+            video = self.crop_transform(video)
+            video = self.normalize_transform(video)  # [T_video, C, H, W]
 
-        video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
+            video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
 
-        # Proxy (from lerobot): 
+        # Proxy (from lerobot):
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
         action = sample["action"] # [T-1, action_dim]
         proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
-        if video.shape[1] <= 1:
-            raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
-            raise ValueError(
-                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
-            )
+        if video_latent is None:
+            if video.shape[1] <= 1:
+                raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
+            if action.shape[0] % (video.shape[1] - 1) != 0:
+                raise ValueError(
+                    f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
+                )
 
         task = sample["instruction"]
         
@@ -221,7 +286,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         context_mask = torch.ones_like(context_mask)
         
         data = {
-            "video": video,
             "action": action,
             "proprio": proprio,
             "prompt": instruction,
@@ -231,6 +295,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        # Include exactly one of video / video_latent (never None, so default_collate works).
+        # build_inputs reads via sample.get(...) and picks whichever is present.
+        if video_latent is not None:
+            data["video_latent"] = video_latent
+        else:
+            data["video"] = video
         return data
 
     def _get_cached_text_context(self, prompt: str):
