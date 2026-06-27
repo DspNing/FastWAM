@@ -11,11 +11,30 @@ from .state_dict_converters import (
 )
 from ..wan_video_dit import WanVideoDiT
 from ..wan_video_text_encoder import HuggingfaceTokenizer, WanTextEncoder
-from ..wan_video_vae import WanVideoVAE38
+from ..wan_video_vae import WanVideoVAE, WanVideoVAE38
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 SKIPPED_PRETRAIN_SENTINEL = "SKIPPED_PRETRAIN"
+
+# Backbone presets: Wan2.2-5B (default, production) vs Wan2.1-1.3B (fast experiments).
+# Bound switch: DiT model_id, VAE file, VAE class, and DiT in_dim are coupled per preset.
+BACKBONE_PRESETS = {
+    "wan22": {
+        "model_id": "Wan-AI/Wan2.2-TI2V-5B",
+        "vae_filename": "Wan2.2_VAE.pth",
+        "vae_redirect": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "Wan2.2_VAE.safetensors"),
+        "vae_z_dim": 48,
+        "dit_in_dim": 48,
+    },
+    "wan21": {
+        "model_id": "Wan-AI/Wan2.1-T2V-1.3B",
+        "vae_filename": "Wan2.1_VAE.pth",
+        "vae_redirect": None,  # Wan2.1_VAE.pth lives in the Wan2.1-T2V-1.3B repo directly
+        "vae_z_dim": 16,
+        "dit_in_dim": 16,
+    },
+}
 
 
 @dataclass
@@ -40,6 +59,12 @@ WAN22_MODEL_REGISTRY = [
     {
         # Example: ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="diffusion_pytorch_model*.safetensors")
         "model_hash": "1f5ab7703c6fc803fdded85ff040c316",
+        "model_name": "wan_video_dit",
+        "model_class": WanVideoDiT,
+    },
+    {
+        # Wan2.1-T2V-1.3B DiT (same WanVideoDiT architecture, 1.3B params: dim=1536, 12 heads, 30 layers)
+        "model_hash": "9269f8db9040a9d860eaca435be61814",
         "model_name": "wan_video_dit",
         "model_class": WanVideoDiT,
     },
@@ -122,19 +147,21 @@ def _load_registered_model(
     return model
 
 
-def _resolve_configs(model_id: str, tokenizer_model_id: str, redirect_common_files: bool = True):
+def _resolve_configs(model_id: str, tokenizer_model_id: str, vae_filename: str, vae_redirect, redirect_common_files: bool = True):
     dit_config = ModelConfig(model_id=model_id, origin_file_pattern="diffusion_pytorch_model*.safetensors")
     text_config = ModelConfig(model_id=model_id, origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth")
-    vae_config = ModelConfig(model_id=model_id, origin_file_pattern="Wan2.2_VAE.pth")
+    vae_config = ModelConfig(model_id=model_id, origin_file_pattern=vae_filename)
     tokenizer_config = ModelConfig(model_id=tokenizer_model_id, origin_file_pattern="google/umt5-xxl/")
 
     if redirect_common_files:
         redirect_dict = {
             "models_t5_umt5-xxl-enc-bf16.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "models_t5_umt5-xxl-enc-bf16.safetensors"),
-            "Wan2.2_VAE.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "Wan2.2_VAE.safetensors"),
         }
+        if vae_redirect is not None:
+            redirect_dict[vae_filename] = vae_redirect
         text_config.model_id, text_config.origin_file_pattern = redirect_dict[text_config.origin_file_pattern]
-        vae_config.model_id, vae_config.origin_file_pattern = redirect_dict[vae_config.origin_file_pattern]
+        if vae_redirect is not None:
+            vae_config.model_id, vae_config.origin_file_pattern = redirect_dict[vae_filename]
     return dit_config, text_config, vae_config, tokenizer_config
 
 
@@ -148,17 +175,23 @@ def load_wan22_ti2v_5b_components(
     dit_config: dict[str, Any] | None = None,
     skip_dit_load_from_pretrain: bool = False,
     load_text_encoder: bool = True,
+    backbone: str = "wan22",
 ):
-    logger.info("Loading Wan2.2-TI2V-5B components...")
+    if backbone not in BACKBONE_PRESETS:
+        raise ValueError(f"`backbone` must be one of {list(BACKBONE_PRESETS)}, got {backbone!r}")
+    preset = BACKBONE_PRESETS[backbone]
+    logger.info("Loading components with backbone=%s (model_id=%s)...", backbone, preset["model_id"])
     start = time.time()
 
     if dit_config is None:
-        raise ValueError("`dit_config` is required for Wan2.2-TI2V-5B loading.")
+        raise ValueError("`dit_config` is required for loading.")
     validated_dit_config = _validate_dit_config(dit_config)
 
     dit_model_config, text_config, vae_config, tokenizer_config = _resolve_configs(
-        model_id=model_id,
+        model_id=preset["model_id"],
         tokenizer_model_id=tokenizer_model_id,
+        vae_filename=preset["vae_filename"],
+        vae_redirect=preset["vae_redirect"],
         redirect_common_files=redirect_common_files,
     )
 
@@ -207,8 +240,19 @@ def load_wan22_ti2v_5b_components(
             "Skipping pretrained text encoder/tokenizer load (`load_text_encoder=False`); "
             "training must provide cached `context/context_mask`."
         )
-    vae: WanVideoVAE38 = _load_registered_model(vae_config.path, "wan_video_vae", torch_dtype=torch_dtype, device=device)
-    logger.info("Finished loading Wan2.2-TI2V-5B components in %.2f seconds.", time.time() - start)
+    if backbone == "wan21":
+        # Wan2.1-1.3B uses the z_dim=16 VAE (WanVideoVAE), not the z_dim=48 WanVideoVAE38.
+        # Same architecture as FastWAM's existing WanVideoVAE (dim=96, 8x spatial, 4x temporal).
+        vae = WanVideoVAE(z_dim=preset["vae_z_dim"]).to(device=device, dtype=torch_dtype)
+        vae_sd = load_state_dict(vae_config.path, torch_dtype=torch_dtype, device="cpu")
+        # Wan2.1_VAE.pth keys are `encoder.*`; WanVideoVAE expects `model.encoder.*`.
+        vae_sd = wan_video_vae_state_dict_converter(vae_sd)
+        vae.load_state_dict(vae_sd, strict=False)
+        vae = vae.eval().requires_grad_(False)
+        logger.info("Loaded Wan2.1 VAE (z_dim=%d) from %s", preset["vae_z_dim"], vae_config.path)
+    else:
+        vae: WanVideoVAE38 = _load_registered_model(vae_config.path, "wan_video_vae", torch_dtype=torch_dtype, device=device)
+    logger.info("Finished loading components in %.2f seconds.", time.time() - start)
     return Wan22LoadedComponents(
         dit=dit,
         vae=vae,

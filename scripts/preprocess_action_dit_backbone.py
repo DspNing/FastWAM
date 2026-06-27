@@ -96,7 +96,7 @@ def _resize_tensor_to_shape(src: torch.Tensor, target_shape: tuple[int, ...]) ->
     return out.to(dtype=src.dtype)
 
 
-def _load_model_config(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_model_config(path: Path, backbone: str = "wan22") -> tuple[dict[str, Any], dict[str, Any], Any]:
     cfg = OmegaConf.load(str(path))
     if "video_dit_config" not in cfg or "action_dit_config" not in cfg:
         raise ValueError(
@@ -105,6 +105,11 @@ def _load_model_config(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
 
     video_cfg = OmegaConf.to_container(cfg.video_dit_config, resolve=False)
     action_cfg = OmegaConf.to_container(cfg.action_dit_config, resolve=False)
+    # Support nested presets {wan22: {...}, wan21: {...}} selected by `backbone`.
+    if isinstance(video_cfg, dict) and set(video_cfg.keys()) <= {"wan22", "wan21"} and backbone in video_cfg:
+        video_cfg = video_cfg[backbone]
+    if isinstance(action_cfg, dict) and set(action_cfg.keys()) <= {"wan22", "wan21"} and backbone in action_cfg:
+        action_cfg = action_cfg[backbone]
     if not isinstance(video_cfg, dict) or not isinstance(action_cfg, dict):
         raise ValueError("`video_dit_config` and `action_dit_config` must resolve to dicts.")
 
@@ -149,6 +154,11 @@ def main() -> None:
         default="true",
         help="Whether to apply alpha=sqrt(dv/da) when the last dimension is resized (true/false). Default: true.",
     )
+    parser.add_argument(
+        "--backbone",
+        default=None,
+        help="Backbone preset (wan22|wan21). Defaults to the yaml's `backbone` field, or wan22 if absent.",
+    )
     args = parser.parse_args()
 
     model_config_path = Path(args.model_config)
@@ -156,7 +166,11 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     apply_alpha_scaling = _parse_bool(args.apply_alpha_scaling)
 
-    video_cfg, action_cfg, cfg = _load_model_config(model_config_path)
+    # Resolve backbone: CLI > yaml field > default wan22.
+    cfg_tmp = OmegaConf.load(str(model_config_path))
+    backbone = args.backbone or cfg_tmp.get("backbone", "wan22")
+
+    video_cfg, action_cfg, cfg = _load_model_config(model_config_path, backbone=backbone)
     torch_dtype = _parse_dtype(args.dtype)
     redirect_common_files = _parse_bool(cfg.get("redirect_common_files", False))
 
@@ -175,6 +189,7 @@ def main() -> None:
         tokenizer_model_id=cfg.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B"),
         redirect_common_files=redirect_common_files,
         dit_config=video_cfg,
+        backbone=backbone,
     )
     video_expert = components.dit
 

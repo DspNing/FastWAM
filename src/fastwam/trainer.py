@@ -179,6 +179,10 @@ class Wan22Trainer:
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
+            # Keep workers alive across epochs (avoids per-epoch respawn cost) and prefetch
+            # ahead so the GPU rarely starves while workers decode the next batch.
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=4 if self.num_workers > 0 else None,
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
