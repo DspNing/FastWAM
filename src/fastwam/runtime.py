@@ -1,5 +1,6 @@
 import logging
 import os
+import copy
 import inspect
 from pathlib import Path
 from typing import Any
@@ -352,15 +353,10 @@ def create_fastwam_idm(
 
 def build_datasets(data_cfg: DictConfig):
     train_ds = instantiate(data_cfg.train)
-    if data_cfg.get("val") is None:
-        val_ds = train_ds
-    else:
-        train_stats_path = data_cfg.train.get("pretrained_norm_stats")
-        default_stats_path = os.path.join(misc.get_work_dir(), "dataset_stats.json")
-        val_stats_path = data_cfg.val.get("pretrained_norm_stats")
-        pretrained_norm_stats = val_stats_path or train_stats_path or default_stats_path
-        logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
-        val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
+    # Val reuses train_ds to avoid a second dataset instance doubling memory (hf_dataset + latent
+    # cache). Eval temporarily disables skip_images on train_ds so it can decode raw video for
+    # PSNR/SSIM, then restores it. See Wan22Trainer.evaluate.
+    val_ds = train_ds
     return train_ds, val_ds
 
 
