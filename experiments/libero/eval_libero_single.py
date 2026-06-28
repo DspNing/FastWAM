@@ -226,8 +226,14 @@ def _obs_to_model_input(
     actual_h, actual_w = int(rgb.shape[0]), int(rgb.shape[1])
     expected_h, expected_w = int(height), int(width)
     image_shapes = [meta["shape"] for meta in image_meta]
+    # When video_size differs from the concatenated shape_meta size (e.g. video_size=[112,224]
+    # but shape_meta produces 224x448 after horizontal concat), resize to video_size to match
+    # the training pipeline (which resizes after concat via ResizeSmallestSideAspectPreserving + CenterCrop).
+    if actual_h != expected_h or actual_w != expected_w:
+        rgb = _center_crop_resize(rgb, width=expected_w, height=expected_h)
+        actual_h, actual_w = int(rgb.shape[0]), int(rgb.shape[1])
     assert actual_h == expected_h and actual_w == expected_w, (
-        "Input image size mismatch after per-camera resize + concat: "
+        "Input image size mismatch after per-camera resize + concat + final resize: "
         f"got (H,W)=({actual_h},{actual_w}), expected (H,W)=({expected_h},{expected_w}) "
         f"from data.train.video_size={[expected_h, expected_w]}; "
         f"shape_meta.images={image_shapes}, concat_multi_camera={concatenation}."
