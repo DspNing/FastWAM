@@ -335,8 +335,13 @@ run_libero_eval() {
         # When the task exits, write a status file so the scheduler can detect failures promptly.
         tmux select-pane -t $SESSION_NAME:$pane_info 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "clear" C-m 2>/dev/null
-        tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && conda activate ${CONDA_ENV} && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
-            export PYTHONPATH=${PYTHONPATH} && \
+        # CONDA_ENV lets a user point panes at a different env (e.g. a cloned
+        # fastwam_plus) without editing this script. Defaults to "fastwam" so
+        # the original usage is unchanged.
+        CONDA_ENV="${CONDA_ENV:-fastwam}"
+        tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && conda activate $CONDA_ENV && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
+            ${USE_LIBERO_PLUS:+export PYTHONPATH=$ROOT_DIR/LIBERO-plus && export LIBERO_CONFIG_PATH=$HOME/.libero_plus && export MAGICK_HOME=\$CONDA_PREFIX && export LD_LIBRARY_PATH=\$CONDA_PREFIX/lib:\$LD_LIBRARY_PATH && }\
+            ${USE_LIBERO_MASTER:+export PYTHONPATH=$ROOT_DIR/LIBERO-master && export LIBERO_CONFIG_PATH=$HOME/.libero && }\
             STATUS_FILE='$status_file' LOG_FILE='$log_file' RESULT_FILE='$result_file' && \
             CUDA_VISIBLE_DEVICES=$gpu_id python experiments/libero/eval_libero_single.py \
             task=$CONFIG ckpt=$CKPT \
