@@ -26,9 +26,9 @@ GRAD_ACCUM=""                                     # 梯度累积步数,留空用
 NUM_WORKERS=""                                  # 每卡 dataloader worker 数,留空用 task 默认(8);如 "16"
 LR=""                                             # 学习率,留空用默认(1e-4);如 "5e-5"
 NUM_EPOCHS=""                                     # epoch 数,留空用默认(10);如 "5"
-MAX_STEPS=""                                      # 最大步数,留空=按epoch算;如 "1000" 用于smoke test
-#RESUME="runs/libero_uncond_2cam224_1e-4/2026-06-27_11-35-24/checkpoints/state/step_002000"                                         # 恢复训练的 state 目录,留空=从头;如 "runs/.../checkpoints/state/step_001000"
-RESUME=""
+MAX_STEPS="28000"                                      # 最大步数,留空=按epoch算;如 "1000" 用于smoke test
+RESUME="runs/libero_uncond_2cam224_1e-4/2026-06-28_11-38-06/checkpoints/state/step_020000"                                         # 恢复训练的 state 目录,留空=从头;如 "runs/.../checkpoints/state/step_001000"
+#RESUME=""
 # backbone 开关(wan22=5B 默认 / wan21=1.3B 快速实验)
 BACKBONE=""                                       # 留空=用 yaml 里的 backbone 值;如 "wan21" 强制覆盖
 
