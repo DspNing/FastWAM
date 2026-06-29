@@ -93,6 +93,8 @@ def create_fastwam(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
     backbone: str = "wan22",
+    p_drop: float = 0.0,
+    enable_proprio_in_tmod: bool = False,
 ):
     from .models.wan22.fastwam import FastWAM
 
@@ -118,6 +120,12 @@ def create_fastwam(
         action_dit_config = action_dit_config[backbone]
     if not isinstance(action_dit_config, dict):
         raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+
+    # Inject proprio_dim + enable_proprio_in_tmod into action_dit_config if enabled.
+    if enable_proprio_in_tmod and proprio_dim is not None:
+        action_dit_config = dict(action_dit_config)  # copy to avoid mutating yaml
+        action_dit_config["proprio_dim"] = int(proprio_dim)
+        action_dit_config["enable_proprio_in_tmod"] = True
 
     # action_dit_pretrained_path may also be nested {wan22: ..., wan21: ...} by backbone.
     if isinstance(action_dit_pretrained_path, DictConfig):
@@ -176,6 +184,7 @@ def create_fastwam(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         backbone=str(backbone),
+        p_drop=float(p_drop),
     )
 
 
@@ -210,6 +219,12 @@ def create_fastwam_joint(
         action_dit_config = {}
     if not isinstance(action_dit_config, dict):
         raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+
+    # Inject proprio_dim + enable_proprio_in_tmod into action_dit_config if enabled.
+    if enable_proprio_in_tmod and proprio_dim is not None:
+        action_dit_config = dict(action_dit_config)  # copy to avoid mutating yaml
+        action_dit_config["proprio_dim"] = int(proprio_dim)
+        action_dit_config["enable_proprio_in_tmod"] = True
 
     if isinstance(video_scheduler, DictConfig):
         video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
@@ -297,6 +312,12 @@ def create_fastwam_idm(
         action_dit_config = {}
     if not isinstance(action_dit_config, dict):
         raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+
+    # Inject proprio_dim + enable_proprio_in_tmod into action_dit_config if enabled.
+    if enable_proprio_in_tmod and proprio_dim is not None:
+        action_dit_config = dict(action_dit_config)  # copy to avoid mutating yaml
+        action_dit_config["proprio_dim"] = int(proprio_dim)
+        action_dit_config["enable_proprio_in_tmod"] = True
 
     if isinstance(video_scheduler, DictConfig):
         video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)

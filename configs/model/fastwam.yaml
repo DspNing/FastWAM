@@ -9,6 +9,11 @@ load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
+# Experiment switches (off = original behavior):
+# p_drop: probability of masking text context tokens during training (for CFG). 0 = off.
+p_drop: 0.0
+# enable_proprio_in_tmod: fuse proprio into timestep modulation (tmod) in action DiT.
+enable_proprio_in_tmod: False
 # action_dit_pretrained_path: nested by backbone. Each points to the ActionDiT backbone
 # interpolated from the corresponding video DiT (run scripts/preprocess_action_dit_backbone.py).
 action_dit_pretrained_path:

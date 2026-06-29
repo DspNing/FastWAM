@@ -38,6 +38,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        p_drop: float = 0.0,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -45,6 +46,7 @@ class FastWAM(torch.nn.Module):
         self.mot = mot
         # Keep trainer compatibility: optimizer and freeze logic use `model.dit`.
         self.dit = self.mot
+        self.p_drop = float(p_drop)
 
         self.vae = vae
         self.text_encoder = text_encoder
@@ -112,6 +114,7 @@ class FastWAM(torch.nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
         backbone: str = "wan22",
+        p_drop: float = 0.0,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -170,6 +173,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            p_drop=p_drop,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -373,6 +377,7 @@ class FastWAM(torch.nn.Module):
             )
         context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        proprio_raw = None  # [B, D] raw proprio for tmod fusion (not the context token)
         if self.proprio_encoder is not None:
             if proprio is None:
                 raise ValueError("`sample['proprio']` is required when `proprio_dim` is enabled.")
@@ -383,10 +388,11 @@ class FastWAM(torch.nn.Module):
                     f"`sample['proprio']` last dim must be {self.proprio_dim}, got {proprio.shape[2]}"
                 )
             proprio = proprio[:, 0, :] # [B, D]
+            proprio_raw = proprio.to(device=self.device, dtype=self.torch_dtype)
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
-                proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
+                proprio=proprio_raw,
             )
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
@@ -398,6 +404,7 @@ class FastWAM(torch.nn.Module):
         return {
             "context": context,
             "context_mask": context_mask,
+            "proprio_raw": proprio_raw,  # [B, D] for tmod fusion; None if proprio disabled
             "input_latents": input_latents,
             "first_frame_latents": first_frame_latents,
             "fuse_vae_embedding_in_latents": fuse_flag,
@@ -475,9 +482,20 @@ class FastWAM(torch.nn.Module):
         batch_size = input_latents.shape[0]
         context = inputs["context"]
         context_mask = inputs["context_mask"]
+        proprio_raw = inputs.get("proprio_raw", None)
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
+
+        # Context dropout for CFG: randomly mask text tokens (keep proprio token at the end).
+        # context structure: [text_tokens(128), proprio_token(1)] when proprio enabled.
+        if self.training and self.p_drop > 0:
+            drop = torch.rand(batch_size, device=context_mask.device) < self.p_drop
+            if drop.any():
+                # text_len = total - proprio(1 if appended else 0)
+                text_len = context_mask.shape[1] - (1 if proprio_raw is not None else 0)
+                context_mask = context_mask.clone()
+                context_mask[drop, :text_len] = False
 
         noise_video = torch.randn_like(input_latents)
         timestep_video = self.train_video_scheduler.sample_training_t(
@@ -514,6 +532,7 @@ class FastWAM(torch.nn.Module):
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
+            proprio=proprio_raw,
         )
 
         video_tokens = video_pre["tokens"]
@@ -602,6 +621,7 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
@@ -664,6 +684,7 @@ class FastWAM(torch.nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
+        proprio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         timestep_video = torch.zeros_like(timestep_action, dtype=first_frame_latents.dtype, device=self.device)
         video_pre = self.video_expert.pre_dit(
@@ -679,6 +700,7 @@ class FastWAM(torch.nn.Module):
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
+            proprio=proprio,
         )
 
         attention_mask = self._build_mot_attention_mask(
@@ -725,12 +747,14 @@ class FastWAM(torch.nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        proprio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
+            proprio=proprio,
         )
         action_tokens = self.mot.forward_action_with_video_cache(
             action_tokens=action_pre["tokens"],
@@ -905,6 +929,7 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 fuse_vae_embedding_in_latents=fuse_flag,
                 gt_action=action,
+                proprio=proprio,
             )
             pred_video = pred_video_posi
             pred_action = pred_action_posi
@@ -1062,8 +1087,28 @@ class FastWAM(torch.nn.Module):
                 video_kv_cache=video_kv_cache,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
+                proprio=proprio,
             )
             pred_action = pred_action_posi
+
+            # Action text CFG: second forward with text-masked context (keep proprio token).
+            # Same formula as wan22.py: pred = pred_posi + (scale-1) * (pred_posi - pred_nega)
+            if text_cfg_scale != 1.0:
+                # Build unconditional mask: drop text tokens, keep proprio (last token if appended)
+                uncond_mask = context_mask.clone()
+                text_len = context_mask.shape[1] - (1 if proprio is not None else 0)
+                uncond_mask[:, :text_len] = False
+                pred_action_nega = self._predict_action_noise_with_cache(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=uncond_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                    proprio=proprio,
+                )
+                pred_action = pred_action + (text_cfg_scale - 1.0) * (pred_action_posi - pred_action_nega)
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 

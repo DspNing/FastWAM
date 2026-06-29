@@ -31,6 +31,7 @@ class ActionHead(nn.Module):
 
 class ActionDiT(nn.Module):
     ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
+    ACTION_BACKBONE_SKIP_SUBSTRINGS = ("proprio_to_time.",)  # NEW params absent from pretrained backbone
     ACTION_BACKBONE_META_KEYS = (
         "hidden_dim",
         "ffn_dim",
@@ -54,6 +55,8 @@ class ActionDiT(nn.Module):
         attn_head_dim: int,
         num_layers: int,
         use_gradient_checkpointing: bool = False,
+        proprio_dim: int = 0,
+        enable_proprio_in_tmod: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -63,6 +66,8 @@ class ActionDiT(nn.Module):
         self.freq_dim = freq_dim
         self.num_heads = num_heads
         self.attn_head_dim = attn_head_dim
+        self.proprio_dim = int(proprio_dim)
+        self.enable_proprio_in_tmod = bool(enable_proprio_in_tmod) and self.proprio_dim > 0
 
         if num_heads <= 0:
             raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
@@ -83,6 +88,16 @@ class ActionDiT(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        # Proprio fused into timestep modulation: proprio [B, proprio_dim] -> [B, hidden_dim],
+        # added to `t` before time_projection. Zero-init last layer => no contribution at start.
+        if self.enable_proprio_in_tmod:
+            self.proprio_to_time = nn.Sequential(
+                nn.SiLU(), nn.Linear(self.proprio_dim, hidden_dim)
+            )
+            nn.init.zeros_(self.proprio_to_time[-1].weight)
+            nn.init.zeros_(self.proprio_to_time[-1].bias)
+        else:
+            self.proprio_to_time = None
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(
@@ -106,6 +121,7 @@ class ActionDiT(nn.Module):
             key
             for key in keys
             if not any(key.startswith(prefix) for prefix in cls.ACTION_BACKBONE_SKIP_PREFIXES)
+            and not any(sub in key for sub in cls.ACTION_BACKBONE_SKIP_SUBSTRINGS)
         }
 
     @classmethod
@@ -229,6 +245,7 @@ class ActionDiT(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if action_tokens.ndim != 3:
             raise ValueError(
@@ -278,6 +295,8 @@ class ActionDiT(nn.Module):
             )
 
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
+        if self.proprio_to_time is not None and proprio is not None:
+            t = t + self.proprio_to_time(proprio.to(dtype=t.dtype, device=t.device))
         t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
 
         tokens = self.action_encoder(action_tokens)
