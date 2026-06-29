@@ -1091,6 +1091,25 @@ class FastWAM(torch.nn.Module):
             )
             pred_action = pred_action_posi
 
+            # Action text CFG: second forward with text-masked context (keep proprio token).
+            # Same formula as wan22.py: pred = pred_posi + (scale-1) * (pred_posi - pred_nega)
+            if text_cfg_scale != 1.0:
+                # Build unconditional mask: drop text tokens, keep proprio (last token if appended)
+                uncond_mask = context_mask.clone()
+                text_len = context_mask.shape[1] - (1 if proprio is not None else 0)
+                uncond_mask[:, :text_len] = False
+                pred_action_nega = self._predict_action_noise_with_cache(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=uncond_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                    proprio=proprio,
+                )
+                pred_action = pred_action + (text_cfg_scale - 1.0) * (pred_action_posi - pred_action_nega)
+
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
         return {
