@@ -28,6 +28,7 @@ train:
   num_frames: 33
   global_sample_stride: 1
   action_video_freq_ratio: 4 # 32 action, 9 video frames
+  # video_size: [224, 448] # final resize video
   video_size: [112, 224] # final resize video
   camera_key: null
   val_set_proportion: 0.0
@@ -66,10 +67,10 @@ train:
   text_embedding_cache_dir: ./data/text_embeds_cache/libero
   context_len: 128
   # Reuse pre-computed dataset stats (skips the ~20s scan on every startup).
-  pretrained_norm_stats: /data/WuKefei/FastWAM/data/vae_latents_cache/dataset_stats.json
+  pretrained_norm_stats: ./data/vae_latents_cache/dataset_stats.json
   # Pre-cached VAE latents to skip mp4-decode + VAE-encode in the training loop (CPU bottleneck).
   # null = decode video on the fly (original path). Set to a dir of latent_*.pt to use cache.
-  vae_latent_cache_dir: /data/WuKefei/FastWAM/data/vae_latents_cache/libero_wan21_112x224
+  vae_latent_cache_dir: ./data/vae_latents_cache/libero_wan21_112x224
   # Pre-cached normalized action/proprio (skips parquet-select + processor, the 519ms bottleneck).
   # null = read action/proprio from parquet on the fly. Set to .pt to use cache.
-  action_proprio_cache_path: /data/WuKefei/FastWAM/data/action_proprio_cache/libero.pt
+  action_proprio_cache_path: ./data/action_proprio_cache/libero.pt

@@ -93,6 +93,7 @@ def create_fastwam(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
     backbone: str = "wan22",
+    use_proprio_modulation: bool = False,
 ):
     from .models.wan22.fastwam import FastWAM
 
@@ -176,6 +177,7 @@ def create_fastwam(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         backbone=str(backbone),
+        use_proprio_modulation=bool(use_proprio_modulation),
     )
 
 
@@ -196,6 +198,7 @@ def create_fastwam_joint(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    use_proprio_modulation: bool = False,
 ):
     from .models.wan22.fastwam_joint import FastWAMJoint
 
@@ -261,6 +264,7 @@ def create_fastwam_joint(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        use_proprio_modulation=bool(use_proprio_modulation),
     )
 
 
@@ -281,6 +285,7 @@ def create_fastwam_idm(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    use_proprio_modulation: bool = False,
 ):
     from .models.wan22.fastwam_idm import (
         FastWAMIDM,
@@ -348,6 +353,7 @@ def create_fastwam_idm(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        use_proprio_modulation=bool(use_proprio_modulation),
     )
 
 

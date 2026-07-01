@@ -188,7 +188,9 @@ class FastWAMJoint(FastWAM):
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
-        if proprio is not None:
+
+        # Append proprio to context only when not using proprio modulation mode.
+        if proprio is not None and not self.use_proprio_modulation:
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
@@ -225,6 +227,7 @@ class FastWAMJoint(FastWAM):
                 context_mask=context_mask,
                 fuse_vae_embedding_in_latents=fuse_flag,
                 gt_action=None,
+                proprio=proprio,
             )
 
             latents_video = self.infer_video_scheduler.step(pred_video_posi, step_delta_video, latents_video)

@@ -15,6 +15,39 @@ from .wan_video_dit import (
 logger = get_logger(__name__)
 
 
+class ProprioTimeMixer(nn.Module):
+    """Fuse proprio and timestep embedding into modulation parameters directly.
+
+    Replaces the original timestep-only modulation (time_projection) with a
+    proprio-aware modulation that conditions on both the diffusion timestep
+    and the robot's initial arm state.
+    """
+
+    def __init__(self, proprio_dim: int, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.proprio_proj = nn.Linear(proprio_dim, hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim * 6),
+        )
+
+    def forward(self, proprio: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            proprio: [B, proprio_dim] — initial robot arm state.
+            t: [B, hidden_dim] — output of time_embedding (timestep embedding).
+        Returns:
+            t_mod: [B, 6, hidden_dim] — modulation parameters replacing the
+                original timestep-only t_mod.
+        """
+        p = self.proprio_proj(proprio)  # [B, hidden_dim]
+        combined = torch.cat([t, p], dim=-1)  # [B, 2*hidden_dim]
+        t_mod = self.mlp(combined)  # [B, hidden_dim * 6]
+        return t_mod.unflatten(1, (6, self.hidden_dim))  # [B, 6, hidden_dim]
+
+
 class ActionHead(nn.Module):
     def __init__(self, hidden_dim: int, out_dim: int, eps: float):
         super().__init__()
@@ -30,7 +63,7 @@ class ActionHead(nn.Module):
 
 
 class ActionDiT(nn.Module):
-    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
+    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.", "proprio_time_mixer.")
     ACTION_BACKBONE_META_KEYS = (
         "hidden_dim",
         "ffn_dim",
@@ -54,6 +87,8 @@ class ActionDiT(nn.Module):
         attn_head_dim: int,
         num_layers: int,
         use_gradient_checkpointing: bool = False,
+        use_proprio_modulation: bool = False,
+        proprio_dim: Optional[int] = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -63,6 +98,8 @@ class ActionDiT(nn.Module):
         self.freq_dim = freq_dim
         self.num_heads = num_heads
         self.attn_head_dim = attn_head_dim
+        self.use_proprio_modulation = bool(use_proprio_modulation)
+        self.proprio_dim = proprio_dim
 
         if num_heads <= 0:
             raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
@@ -83,6 +120,14 @@ class ActionDiT(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+
+        # Proprio-aware modulation: replaces time_projection when enabled.
+        if self.use_proprio_modulation and proprio_dim is not None:
+            self.proprio_time_mixer = ProprioTimeMixer(
+                proprio_dim=proprio_dim,
+                hidden_dim=hidden_dim,
+            )
+
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(
@@ -229,6 +274,7 @@ class ActionDiT(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if action_tokens.ndim != 3:
             raise ValueError(
@@ -278,7 +324,12 @@ class ActionDiT(nn.Module):
             )
 
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
-        t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
+        if self.use_proprio_modulation and proprio is not None:
+            # Proprio-aware modulation: fuse proprio + timestep into modulation params.
+            t_mod = self.proprio_time_mixer(proprio, t)
+        else:
+            # Fallback: original timestep-only modulation.
+            t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
 
         tokens = self.action_encoder(action_tokens)
         context_emb = self.text_embedding(context)
@@ -307,12 +358,14 @@ class ActionDiT(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         pre_state = self.pre_dit(
             action_tokens=action_tokens,
             timestep=timestep,
             context=context,
             context_mask=context_mask,
+            proprio=proprio,
         )
         x = pre_state["tokens"]
         context = pre_state["context"]

@@ -767,7 +767,7 @@ class Wan22Trainer:
                         )
                         logger.info(description)
 
-                        wandb_payload = {
+                        train_payload = {
                             "train/loss": global_loss,
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
@@ -775,9 +775,9 @@ class Wan22Trainer:
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
                         }
                         for key, value in global_loss_metrics.items():
-                            wandb_payload[f"train/{key}"] = value
-                        self._wandb_log(wandb_payload)
-                        self._tensorboard_log(wandb_payload)
+                            train_payload[f"train/{key}"] = value
+                        self._wandb_log(train_payload)
+                        self._tensorboard_log(train_payload)
 
                     if (
                         self.eval_every > 0

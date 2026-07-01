@@ -137,6 +137,7 @@ class FastWAMIDM(FastWAMJoint):
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
+            proprio=inputs["proprio_for_action"],
         )
 
         noisy_video_seq_len = int(video_pre_noisy["tokens"].shape[1])
@@ -370,7 +371,9 @@ class FastWAMIDM(FastWAMJoint):
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
-        if proprio is not None:
+
+        # Append proprio to context only when not using proprio modulation mode.
+        if proprio is not None and not self.use_proprio_modulation:
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
@@ -443,6 +446,7 @@ class FastWAMIDM(FastWAMJoint):
                 video_kv_cache=video_kv_cache,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
+                proprio=proprio,
             )
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 

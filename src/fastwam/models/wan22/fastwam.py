@@ -38,6 +38,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        use_proprio_modulation: bool = False,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -55,7 +56,11 @@ class FastWAM(torch.nn.Module):
             text_dim = int(self.text_encoder.dim)
         self.text_dim = int(text_dim)
         self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
-        if self.proprio_dim is not None:
+        self.use_proprio_modulation = bool(use_proprio_modulation)
+
+        # Proprio encoder: projects proprio to text_dim for appending to context.
+        # Only used when use_proprio_modulation=False (original behavior).
+        if self.proprio_dim is not None and not self.use_proprio_modulation:
             self.proprio_encoder = nn.Linear(self.proprio_dim, self.text_dim).to(torch_dtype)
         else:
             self.proprio_encoder = None
@@ -112,6 +117,7 @@ class FastWAM(torch.nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
         backbone: str = "wan22",
+        use_proprio_modulation: bool = False,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -132,6 +138,14 @@ class FastWAM(torch.nn.Module):
         )
 
         video_expert = components.dit
+        # Inject proprio_dim and use_proprio_modulation into action_dit_config so ActionDiT
+        # can conditionally build ProprioTimeMixer.
+        if action_dit_config is not None:
+            action_dit_config = dict(action_dit_config)
+        if proprio_dim is not None and action_dit_config is not None:
+            action_dit_config["proprio_dim"] = int(proprio_dim)
+        if use_proprio_modulation and action_dit_config is not None:
+            action_dit_config["use_proprio_modulation"] = True
         action_expert = ActionDiT.from_pretrained(
             action_dit_config=action_dit_config,
             action_dit_pretrained_path=action_dit_pretrained_path,
@@ -170,6 +184,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            use_proprio_modulation=use_proprio_modulation,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -373,6 +388,11 @@ class FastWAM(torch.nn.Module):
             )
         context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+
+        # Proprio handling depends on use_proprio_modulation flag.
+        # When disabled (default): proprio is appended to context (original behavior).
+        # When enabled: proprio is extracted for action expert modulation only.
+        proprio_for_action = None
         if self.proprio_encoder is not None:
             if proprio is None:
                 raise ValueError("`sample['proprio']` is required when `proprio_dim` is enabled.")
@@ -382,12 +402,18 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     f"`sample['proprio']` last dim must be {self.proprio_dim}, got {proprio.shape[2]}"
                 )
-            proprio = proprio[:, 0, :] # [B, D]
-            context, context_mask = self._append_proprio_to_context(
-                context=context,
-                context_mask=context_mask,
-                proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
-            )
+            if self.use_proprio_modulation:
+                # Proprio-aware modulation mode: extract initial state for action expert.
+                proprio_for_action = proprio[:, 0, :].to(device=self.device, dtype=self.torch_dtype)
+            else:
+                # Original mode: project and append proprio token to context.
+                proprio = proprio[:, 0, :].to(device=self.device, dtype=self.torch_dtype)
+                context, context_mask = self._append_proprio_to_context(
+                    context=context,
+                    context_mask=context_mask,
+                    proprio=proprio,
+                )
+
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
         if action_is_pad is not None:
@@ -404,6 +430,7 @@ class FastWAM(torch.nn.Module):
             "action": action,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
+            "proprio_for_action": proprio_for_action,
         }
 
     @torch.no_grad()
@@ -514,6 +541,7 @@ class FastWAM(torch.nn.Module):
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
+            proprio=inputs["proprio_for_action"],
         )
 
         video_tokens = video_pre["tokens"]
@@ -602,6 +630,7 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
@@ -616,6 +645,7 @@ class FastWAM(torch.nn.Module):
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
+            proprio=proprio,
         )
 
         attention_mask = self._build_mot_attention_mask(
@@ -664,6 +694,7 @@ class FastWAM(torch.nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
+        proprio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         timestep_video = torch.zeros_like(timestep_action, dtype=first_frame_latents.dtype, device=self.device)
         video_pre = self.video_expert.pre_dit(
@@ -679,6 +710,7 @@ class FastWAM(torch.nn.Module):
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
+            proprio=proprio,
         )
 
         attention_mask = self._build_mot_attention_mask(
@@ -725,12 +757,14 @@ class FastWAM(torch.nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        proprio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
             context=context,
             context_mask=context_mask,
+            proprio=proprio,
         )
         action_tokens = self.mot.forward_action_with_video_cache(
             action_tokens=action_pre["tokens"],
@@ -868,7 +902,9 @@ class FastWAM(torch.nn.Module):
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
-        if proprio is not None:
+
+        # Append proprio to context only when not using proprio modulation mode.
+        if proprio is not None and not self.use_proprio_modulation:
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
@@ -905,6 +941,7 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 fuse_vae_embedding_in_latents=fuse_flag,
                 gt_action=action,
+                proprio=proprio,
             )
             pred_video = pred_video_posi
             pred_action = pred_action_posi
@@ -1007,7 +1044,9 @@ class FastWAM(torch.nn.Module):
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
-        if proprio is not None:
+
+        # Append proprio to context only when not using proprio modulation mode.
+        if proprio is not None and not self.use_proprio_modulation:
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
@@ -1062,6 +1101,7 @@ class FastWAM(torch.nn.Module):
                 video_kv_cache=video_kv_cache,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
+                proprio=proprio,
             )
             pred_action = pred_action_posi
 

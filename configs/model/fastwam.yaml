@@ -9,6 +9,7 @@ load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
 mot_checkpoint_mixed_attn: true
+use_proprio_modulation: true
 # action_dit_pretrained_path: nested by backbone. Each points to the ActionDiT backbone
 # interpolated from the corresponding video DiT (run scripts/preprocess_action_dit_backbone.py).
 action_dit_pretrained_path:
@@ -71,6 +72,7 @@ video_dit_config:
 action_dit_config:
   wan22:
     action_dim: ${data.train.processor.action_output_dim}
+    proprio_dim: ${data.train.processor.proprio_output_dim}
     hidden_dim: 1024
     ffn_dim: 4096
     num_heads: 24
@@ -82,6 +84,7 @@ action_dit_config:
     use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
   wan21:
     action_dim: ${data.train.processor.action_output_dim}
+    proprio_dim: ${data.train.processor.proprio_output_dim}
     hidden_dim: 1024
     ffn_dim: 4096
     num_heads: 12

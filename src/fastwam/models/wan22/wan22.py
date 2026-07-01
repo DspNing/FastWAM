@@ -55,6 +55,7 @@ class Wan22Core(torch.nn.Module):
         train_shift: float = 5.0,
         infer_shift: float = 5.0,
         num_train_timesteps: int = 1000,
+        backbone: str = "wan22",
     ):
         if dit_config is None:
             raise ValueError("`dit_config` is required for Wan22Core.from_wan22_pretrained().")
@@ -66,6 +67,7 @@ class Wan22Core(torch.nn.Module):
             tokenizer_max_len=tokenizer_max_len,
             redirect_common_files=redirect_common_files,
             dit_config=dit_config,
+            backbone=backbone,
         )
         model = cls(
             dit=components.dit,
